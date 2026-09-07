@@ -32,8 +32,19 @@ jobs:
           import os, sys, re, json, requests
           from datetime import datetime, timedelta, timezone
 
+          def log(msg):
+              print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
+
           def env(name):
-              return (os.getenv(name) or "").strip()
+              raw = os.getenv(name) or ""
+              # Phones and chat apps sneak invisible characters (zero-width spaces, non-breaking
+              # spaces, smart quotes) into pasted secrets. Every value read here is plain printable
+              # ASCII with no spaces, so anything else is junk: drop it and say how much was dropped.
+              cleaned = "".join(ch for ch in raw if 0x21 <= ord(ch) <= 0x7E)
+              dropped = len(raw) - len(cleaned)
+              if dropped and raw.strip() != cleaned:
+                  log(f"Cleaned {dropped} hidden/invisible character(s) out of the {name} secret")
+              return cleaned
 
           CRM_URL = env("SUPABASE_URL").rstrip("/")
           CRM_KEY = env("SUPABASE_SECRET_KEY")
@@ -45,9 +56,6 @@ jobs:
           CHAT_ID = env("TELEGRAM_CHAT_ID")
           AGENT_NAME = "LEAD DELIVERY HEARTBEAT"
           problems = []
-
-          def log(msg):
-              print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
 
           def hdr(key, **extra):
               return {"apikey": key, "Authorization": f"Bearer {key}", **extra}
@@ -78,6 +86,12 @@ jobs:
 
           def telegram_token_ok():
               global BOT_TOKEN
+              if not re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{30,}", BOT_TOKEN):
+                  log("Telegram bot token is not the right shape. It should look like 1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+                  log("  -> Fix: GitHub repo > Settings > Secrets and variables > Actions > TELEGRAM_BOT_TOKEN > Update,")
+                  log("     and paste ONLY the token from @BotFather (tap it in Telegram to copy) - no other words.")
+                  problems.append("Telegram bot token is wrong")
+                  return False
               code, data = tg("getMe", {})
               if code == 200 and data.get("ok"):
                   log(f"Telegram bot token OK (bot: @{data['result'].get('username')})")
@@ -297,6 +311,10 @@ jobs:
                   # Stuck = no email sent AND older than the 15-minute grace period
                   stuck = [l for l in leads if l.get(sent_col) is None and (l.get(created_col) or "") <= grace_cutoff]
                   log(f"Checked {len(leads)} leads, found {len(stuck)} stuck")
+              except UnicodeEncodeError as e:
+                  log("Could not query leads: a secret still contains characters that are not plain text.")
+                  log("  -> Re-paste LEADS_SUPABASE_KEY (and LEADS_SUPABASE_URL) in GitHub > Settings > Secrets, copying from a plain source.")
+                  problems.append("could not query leads: a secret contains hidden characters - re-paste LEADS_SUPABASE_KEY")
               except Exception as e:
                   log(f"Could not query leads: {e}")
                   problems.append(f"could not query leads: {e}")
