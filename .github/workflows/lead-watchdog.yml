@@ -10,8 +10,12 @@ jobs:
   watchdog:
     runs-on: ubuntu-latest
     env:
+      # CRM database (heartbeat lives here, in agent_runs)
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      # Website database (where the leads table lives). If these are blank, the CRM database is used.
+      LEADS_SUPABASE_URL: ${{ secrets.LEADS_SUPABASE_URL }}
+      LEADS_SUPABASE_KEY: ${{ secrets.LEADS_SUPABASE_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
@@ -21,20 +25,26 @@ jobs:
       - name: Run Lead Delivery Watchdog
         run: |
           python3 - <<'PYEOF'
-          import os, sys, re, requests
+          import os, sys, re, json, requests
           from datetime import datetime, timedelta, timezone
 
-          SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
-          SUPABASE_KEY = (os.getenv("SUPABASE_SECRET_KEY") or "").strip()
-          BOT_TOKEN = re.sub(r"^bot", "", (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip())
-          CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+          def env(name):
+              return (os.getenv(name) or "").strip()
+
+          CRM_URL = env("SUPABASE_URL").rstrip("/")
+          CRM_KEY = env("SUPABASE_SECRET_KEY")
+          LEADS_URL = (env("LEADS_SUPABASE_URL") or CRM_URL).rstrip("/")
+          LEADS_KEY = env("LEADS_SUPABASE_KEY") or CRM_KEY
+          BOT_TOKEN = re.sub(r"^bot", "", env("TELEGRAM_BOT_TOKEN"))
+          CHAT_ID = env("TELEGRAM_CHAT_ID")
+          AGENT_NAME = "LEAD DELIVERY HEARTBEAT"
           problems = []
 
           def log(msg):
               print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
 
-          def sb_headers():
-              return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+          def hdr(key, **extra):
+              return {"apikey": key, "Authorization": f"Bearer {key}", **extra}
 
           # ---------- Telegram ----------
           def tg(method, payload):
@@ -83,24 +93,22 @@ jobs:
                   log(f"Retry failed ({code}): {data.get('description')}")
               return False
 
-          # ---------- Supabase ----------
-          def discover_leads_table():
-              """Read the API schema, log every table, and pick the leads table + its columns."""
-              r = requests.get(f"{SUPABASE_URL}/rest/v1/", headers=sb_headers(), timeout=20)
+          # ---------- Supabase helpers ----------
+          def schema(url, key):
+              r = requests.get(f"{url}/rest/v1/", headers=hdr(key), timeout=20)
               r.raise_for_status()
-              spec = r.json()
-              defs = spec.get("definitions", {})
+              return r.json().get("definitions", {})
+
+          def discover_leads_table(defs):
               tables = sorted(defs.keys())
-              log(f"Tables visible to this key: {', '.join(tables) or '(none)'}")
-
-              def cols(t):
-                  return list(defs.get(t, {}).get("properties", {}).keys())
-
+              log(f"Tables in the leads database: {', '.join(tables) or '(none)'}")
+              cols = lambda t: list(defs.get(t, {}).get("properties", {}).keys())
               candidates = [t for t in tables if "email_sent_at" in cols(t)]
               if not candidates:
                   candidates = [t for t in tables if re.search(r"lead|enquir|inquir|submission|contact", t, re.I)]
               if not candidates:
-                  raise RuntimeError("no table looks like a leads table (none has an email_sent_at column or a lead-like name)")
+                  raise RuntimeError("no leads table here. The website leads live in a different database - "
+                                     "add LEADS_SUPABASE_URL and LEADS_SUPABASE_KEY secrets pointing at it")
               table = "leads" if "leads" in candidates else candidates[0]
               c = cols(table)
               created = next((x for x in ("created_at", "inserted_at", "submitted_at") if x in c), None)
@@ -111,20 +119,57 @@ jobs:
                   raise RuntimeError(f"table '{table}' has no created/email-sent timestamp columns I recognise")
               return table, created, sent
 
+          def ensure_registered(defs):
+              """agent_runs.agent_name must exist in agent_registry. Register once, copying the table's rules."""
+              r = requests.get(f"{CRM_URL}/rest/v1/agent_registry", params={"agent_name": f"eq.{AGENT_NAME}", "select": "*"},
+                               headers=hdr(CRM_KEY), timeout=20)
+              if r.status_code == 200 and r.json():
+                  log(f"Agent '{AGENT_NAME}' is registered in agent_registry")
+                  return True
+              reg = defs.get("agent_registry", {})
+              props = reg.get("properties", {})
+              required = [c for c in reg.get("required", []) if c != "agent_name"]
+              log(f"Registering '{AGENT_NAME}' in agent_registry (columns: {', '.join(props) or '?'}; required: {', '.join(required) or 'none'})")
+              sample = {}
+              r = requests.get(f"{CRM_URL}/rest/v1/agent_registry", params={"select": "*", "limit": "1"}, headers=hdr(CRM_KEY), timeout=20)
+              if r.status_code == 200 and r.json():
+                  sample = r.json()[0]
+                  log(f"  example existing row: {json.dumps(sample)[:400]}")
+              row = {"agent_name": AGENT_NAME}
+              now = datetime.now(timezone.utc).isoformat()
+              for col in required:
+                  t = props.get(col, {}).get("type")
+                  if col in sample and sample[col] is not None and not re.search(r"^id$|_id$|_at$", col):
+                      row[col] = sample[col]
+                  elif t == "boolean":
+                      row[col] = True
+                  elif t in ("integer", "number"):
+                      row[col] = 0
+                  elif props.get(col, {}).get("format", "").startswith("timestamp"):
+                      row[col] = now
+                  else:
+                      row[col] = "daily 8am Brisbane lead delivery check (GitHub Actions)"
+              for col, val in {"description": "Checks website leads were emailed; alerts Telegram. Runs daily 8am Brisbane via GitHub Actions.",
+                               "purpose": "Lead delivery watchdog", "schedule": "daily 22:00 UTC", "cadence": "daily",
+                               "owner": "GitHub Actions", "status": "active", "is_active": True, "active": True, "enabled": True}.items():
+                  if col in props and col not in row:
+                      row[col] = val
+              log(f"  inserting: {json.dumps(row)[:400]}")
+              r = requests.post(f"{CRM_URL}/rest/v1/agent_registry", json=row,
+                                headers=hdr(CRM_KEY, **{"Content-Type": "application/json", "Prefer": "return=minimal"}), timeout=20)
+              if r.status_code in (200, 201, 204):
+                  log("  registered OK")
+                  return True
+              log(f"  registration failed ({r.status_code}): {r.text[:600]}")
+              problems.append(f"could not register agent in agent_registry: {r.text[:200]}")
+              return False
+
           def write_heartbeat(detail):
               now = datetime.now(timezone.utc).isoformat()
-              row = {
-                  "agent_name": "LEAD DELIVERY HEARTBEAT",
-                  "due_at": now,
-                  "verdict": "landed",
-                  "artifact_ref": "heartbeat",
-                  "artifact_at": now,
-                  "detail": detail[:500],
-                  "checked_at": now,
-              }
-              r = requests.post(f"{SUPABASE_URL}/rest/v1/agent_runs", json=row,
-                                headers={**sb_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
-                                timeout=20)
+              row = {"agent_name": AGENT_NAME, "due_at": now, "verdict": "landed", "artifact_ref": "heartbeat",
+                     "artifact_at": now, "detail": detail[:500], "checked_at": now}
+              r = requests.post(f"{CRM_URL}/rest/v1/agent_runs", json=row,
+                                headers=hdr(CRM_KEY, **{"Content-Type": "application/json", "Prefer": "return=minimal"}), timeout=20)
               if r.status_code in (200, 201, 204):
                   log(f"Heartbeat written: {detail}")
                   return True
@@ -136,13 +181,23 @@ jobs:
               log("=" * 60)
               log("LEAD DELIVERY WATCHDOG - STARTING")
               log("=" * 60)
-              missing = [k for k, v in {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_SECRET_KEY": SUPABASE_KEY,
+              missing = [k for k, v in {"SUPABASE_URL": CRM_URL, "SUPABASE_SECRET_KEY": CRM_KEY,
                                         "TELEGRAM_BOT_TOKEN": BOT_TOKEN, "TELEGRAM_CHAT_ID": CHAT_ID}.items() if not v]
               if missing:
                   log(f"FATAL: missing secrets: {', '.join(missing)}")
                   sys.exit(1)
+              log(f"Leads database: {LEADS_URL}{'  (same as CRM - set LEADS_SUPABASE_URL/KEY if leads live elsewhere)' if LEADS_URL == CRM_URL else ''}")
 
               tg_ok = telegram_token_ok()
+
+              log("STEP 0: Checking heartbeat registration...")
+              crm_defs = None
+              try:
+                  crm_defs = schema(CRM_URL, CRM_KEY)
+                  ensure_registered(crm_defs)
+              except Exception as e:
+                  log(f"Could not read CRM schema: {e}")
+                  problems.append(f"CRM schema read failed: {e}")
 
               now = datetime.now(timezone.utc)
               window_start = (now - timedelta(hours=26)).isoformat()
@@ -151,10 +206,11 @@ jobs:
               log("STEP 1: Querying leads from the last 26 hours...")
               leads, stuck = [], []
               try:
-                  table, created_col, sent_col = discover_leads_table()
-                  r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}",
+                  leads_defs = crm_defs if (LEADS_URL == CRM_URL and crm_defs is not None) else schema(LEADS_URL, LEADS_KEY)
+                  table, created_col, sent_col = discover_leads_table(leads_defs)
+                  r = requests.get(f"{LEADS_URL}/rest/v1/{table}",
                                    params={"select": "*", created_col: f"gte.{window_start}", "order": f"{created_col}.desc"},
-                                   headers=sb_headers(), timeout=20)
+                                   headers=hdr(LEADS_KEY), timeout=20)
                   r.raise_for_status()
                   leads = r.json()
                   # Stuck = no email sent AND older than the 15-minute grace period
