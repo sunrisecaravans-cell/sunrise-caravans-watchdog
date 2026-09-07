@@ -16,6 +16,10 @@ jobs:
       # Website database (where the leads table lives). If these are blank, the CRM database is used.
       LEADS_SUPABASE_URL: ${{ secrets.LEADS_SUPABASE_URL }}
       LEADS_SUPABASE_KEY: ${{ secrets.LEADS_SUPABASE_KEY }}
+      # Optional: log in to the website database as an admin user instead of using a master key.
+      # When these are set, LEADS_SUPABASE_KEY should be the public (anon/publishable) key.
+      LEADS_ADMIN_EMAIL: ${{ secrets.LEADS_ADMIN_EMAIL }}
+      LEADS_ADMIN_PASSWORD: ${{ secrets.LEADS_ADMIN_PASSWORD }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
@@ -35,6 +39,8 @@ jobs:
           CRM_KEY = env("SUPABASE_SECRET_KEY")
           LEADS_URL = (env("LEADS_SUPABASE_URL") or CRM_URL).rstrip("/")
           LEADS_KEY = env("LEADS_SUPABASE_KEY") or CRM_KEY
+          LEADS_ADMIN_EMAIL = env("LEADS_ADMIN_EMAIL")
+          LEADS_ADMIN_PASSWORD = env("LEADS_ADMIN_PASSWORD")
           BOT_TOKEN = re.sub(r"^bot", "", env("TELEGRAM_BOT_TOKEN"))
           CHAT_ID = env("TELEGRAM_CHAT_ID")
           AGENT_NAME = "LEAD DELIVERY HEARTBEAT"
@@ -124,10 +130,30 @@ jobs:
               return False
 
           # ---------- Supabase helpers ----------
-          def schema(url, key):
-              r = requests.get(f"{url}/rest/v1/", headers=hdr(key), timeout=20)
+          def schema(url, headers):
+              r = requests.get(f"{url}/rest/v1/", headers=headers, timeout=20)
               r.raise_for_status()
               return r.json().get("definitions", {})
+
+          def leads_headers():
+              """Headers for the leads database. With an admin login configured, sign in through
+              Supabase Auth using the public key and use that user's session token. Without one,
+              fall back to treating LEADS_KEY as a key that can read the table directly."""
+              if not (LEADS_ADMIN_EMAIL and LEADS_ADMIN_PASSWORD):
+                  return hdr(LEADS_KEY)
+              r = requests.post(f"{LEADS_URL}/auth/v1/token", params={"grant_type": "password"},
+                                json={"email": LEADS_ADMIN_EMAIL, "password": LEADS_ADMIN_PASSWORD},
+                                headers={"apikey": LEADS_KEY, "Content-Type": "application/json"}, timeout=20)
+              token = None
+              try:
+                  token = r.json().get("access_token")
+              except Exception:
+                  pass
+              if r.status_code != 200 or not token:
+                  raise RuntimeError(f"admin login to the leads database failed ({r.status_code}). "
+                                     "Check the LEADS_ADMIN_EMAIL and LEADS_ADMIN_PASSWORD secrets")
+              log(f"Logged in to the leads database as {LEADS_ADMIN_EMAIL}")
+              return {"apikey": LEADS_KEY, "Authorization": f"Bearer {token}"}
 
           def discover_leads_table(defs):
               tables = sorted(defs.keys())
@@ -247,7 +273,7 @@ jobs:
               log("STEP 0: Checking heartbeat registration...")
               crm_defs = None
               try:
-                  crm_defs = schema(CRM_URL, CRM_KEY)
+                  crm_defs = schema(CRM_URL, hdr(CRM_KEY))
                   ensure_registered(crm_defs)
               except Exception as e:
                   log(f"Could not read CRM schema: {e}")
@@ -260,11 +286,12 @@ jobs:
               log("STEP 1: Querying leads from the last 26 hours...")
               leads, stuck = [], []
               try:
-                  leads_defs = crm_defs if (LEADS_URL == CRM_URL and crm_defs is not None) else schema(LEADS_URL, LEADS_KEY)
+                  leads_hdr = leads_headers()
+                  leads_defs = crm_defs if (LEADS_URL == CRM_URL and crm_defs is not None) else schema(LEADS_URL, leads_hdr)
                   table, created_col, sent_col = discover_leads_table(leads_defs)
                   r = requests.get(f"{LEADS_URL}/rest/v1/{table}",
                                    params={"select": "*", created_col: f"gte.{window_start}", "order": f"{created_col}.desc"},
-                                   headers=hdr(LEADS_KEY), timeout=20)
+                                   headers=leads_hdr, timeout=20)
                   r.raise_for_status()
                   leads = r.json()
                   # Stuck = no email sent AND older than the 15-minute grace period
