@@ -17,8 +17,7 @@ jobs:
       # these secrets only override them.
       LEADS_SUPABASE_URL: ${{ secrets.LEADS_SUPABASE_URL }}
       LEADS_SUPABASE_KEY: ${{ secrets.LEADS_SUPABASE_KEY }}
-      # Log in to the website database as an admin user (no master key needed).
-      LEADS_ADMIN_EMAIL: ${{ secrets.LEADS_ADMIN_EMAIL }}
+      # Password for the watchdog's own login on the website (sunrisecaravans+watchdog@gmail.com).
       LEADS_ADMIN_PASSWORD: ${{ secrets.LEADS_ADMIN_PASSWORD }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -54,6 +53,7 @@ jobs:
           WEBSITE_ANON_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
                               "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtteHJpd2ZzdXZyZHdqYndmbG9oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwMzI5NTEsImV4cCI6MjA4ODYwODk1MX0."
                               "i9zqQJ-_BUm_DFpALeuGV6Yg-kvQE6qnF4R9SVWxvH0")
+          # The watchdog's own admin login on the website. It has exactly one, so it is built in.
           WATCHDOG_EMAIL = "sunrisecaravans+watchdog@gmail.com"
 
           def jwt_claims(token):
@@ -81,7 +81,7 @@ jobs:
                       "Using the built-in public key instead - you can delete that secret.")
               LEADS_KEY = WEBSITE_ANON_KEY
 
-          LEADS_ADMIN_EMAIL = env("LEADS_ADMIN_EMAIL") or WATCHDOG_EMAIL
+          LEADS_ADMIN_EMAIL = WATCHDOG_EMAIL
           LEADS_ADMIN_PASSWORD = env("LEADS_ADMIN_PASSWORD")
           BOT_TOKEN = re.sub(r"^bot", "", env("TELEGRAM_BOT_TOKEN"))
           CHAT_ID = env("TELEGRAM_CHAT_ID")
@@ -202,8 +202,6 @@ jobs:
                       hint = "the website key is wrong - delete the LEADS_SUPABASE_KEY secret so the built-in one is used"
                   elif len(LEADS_ADMIN_PASSWORD) != 24:
                       hint = "the LEADS_ADMIN_PASSWORD secret has the wrong number of characters - re-paste it, nothing else in the box"
-                  elif LEADS_ADMIN_EMAIL != WATCHDOG_EMAIL:
-                      hint = f"the LEADS_ADMIN_EMAIL secret should be exactly {WATCHDOG_EMAIL}"
                   else:
                       hint = "re-paste the LEADS_ADMIN_PASSWORD secret (only the password, no spaces or quotes)"
                   raise RuntimeError(f"admin login to the leads database failed: {reason}. Fix: {hint}")
