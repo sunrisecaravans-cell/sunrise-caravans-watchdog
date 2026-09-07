@@ -340,13 +340,30 @@ jobs:
               leads, stuck = [], []
               try:
                   leads_hdr = leads_headers()
-                  leads_defs = crm_defs if (LEADS_URL == CRM_URL and crm_defs is not None) else schema(LEADS_URL, leads_hdr)
-                  table, created_col, sent_col = discover_leads_table(leads_defs)
-                  r = requests.get(f"{LEADS_URL}/rest/v1/{table}",
-                                   params={"select": "*", created_col: f"gte.{window_start}", "order": f"{created_col}.desc"},
-                                   headers=leads_hdr, timeout=20)
-                  r.raise_for_status()
+                  # The website's leads table is known (public.leads with created_at / email_sent_at), so ask
+                  # for it directly. The website refuses the /rest/v1/ "list every table" request with 401
+                  # even for a logged-in admin, so only fall back to that discovery if the table has moved.
+                  table, created_col, sent_col = "leads", "created_at", "email_sent_at"
+                  def fetch(table, created_col):
+                      return requests.get(f"{LEADS_URL}/rest/v1/{table}",
+                                          params={"select": "*", created_col: f"gte.{window_start}", "order": f"{created_col}.desc"},
+                                          headers=leads_hdr, timeout=20)
+                  r = fetch(table, created_col)
+                  if r.status_code == 404:
+                      log("The 'leads' table was not found - asking the database what tables it has...")
+                      leads_defs = crm_defs if (LEADS_URL == CRM_URL and crm_defs is not None) else schema(LEADS_URL, leads_hdr)
+                      table, created_col, sent_col = discover_leads_table(leads_defs)
+                      r = fetch(table, created_col)
+                  if r.status_code != 200:
+                      reason = r.text[:300]
+                      if r.status_code in (401, 403):
+                          hint = ("the watchdog login is not allowed to read leads - check the account still has the "
+                                  "admin role in user_roles on the website database")
+                      else:
+                          hint = "see the response above"
+                      raise RuntimeError(f"the leads database refused the query ({r.status_code}): {reason}. Fix: {hint}")
                   leads = r.json()
+                  log(f"Read {len(leads)} lead(s) from '{table}' created since {window_start[:19]} UTC")
                   # Stuck = no email sent AND older than the 15-minute grace period
                   stuck = [l for l in leads if l.get(sent_col) is None and (l.get(created_col) or "") <= grace_cutoff]
                   log(f"Checked {len(leads)} leads, found {len(stuck)} stuck")
