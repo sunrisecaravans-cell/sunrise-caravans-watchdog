@@ -21,13 +21,14 @@ jobs:
       - name: Run Lead Delivery Watchdog
         run: |
           python3 - <<'PYEOF'
-          import os, sys, requests
+          import os, sys, re, requests
           from datetime import datetime, timedelta, timezone
 
-          SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
-          SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") or ""
-          BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
-          CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
+          SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+          SUPABASE_KEY = (os.getenv("SUPABASE_SECRET_KEY") or "").strip()
+          BOT_TOKEN = re.sub(r"^bot", "", (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip())
+          CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+          problems = []
 
           def log(msg):
               print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
@@ -35,21 +36,34 @@ jobs:
           def sb_headers():
               return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
 
+          # ---------- Telegram ----------
           def tg(method, payload):
               r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload, timeout=15)
-              return r.status_code, r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+              try:
+                  return r.status_code, r.json()
+              except Exception:
+                  return r.status_code, {}
+
+          def telegram_token_ok():
+              code, data = tg("getMe", {})
+              if code == 200 and data.get("ok"):
+                  log(f"Telegram bot token OK (bot: @{data['result'].get('username')})")
+                  return True
+              log(f"Telegram REJECTED the bot token ({code}): {data.get('description')}")
+              log("  -> Fix: GitHub repo > Settings > Secrets and variables > Actions > TELEGRAM_BOT_TOKEN > Update,")
+              log("     paste the token from @BotFather exactly (looks like 123456789:AAxxxxxxxx), nothing else.")
+              problems.append("Telegram bot token is wrong")
+              return False
 
           def resolve_chat_id():
-              # If the configured chat id is a bot username (e.g. @SunriseContentBot), it can't receive
-              # messages. Fall back to the most recent chat that has messaged the bot.
-              try:
-                  code, data = tg("getUpdates", {"limit": 100})
-                  for upd in reversed(data.get("result", [])):
-                      msg = upd.get("message") or upd.get("channel_post") or {}
-                      if msg.get("chat", {}).get("id"):
-                          return msg["chat"]["id"]
-              except Exception as e:
-                  log(f"getUpdates failed: {e}")
+              # A bot username (e.g. @SunriseContentBot) can't receive messages. Use the most
+              # recent chat that has messaged the bot instead.
+              code, data = tg("getUpdates", {"limit": 100})
+              for upd in reversed(data.get("result", [])):
+                  msg = upd.get("message") or upd.get("channel_post") or {}
+                  if msg.get("chat", {}).get("id"):
+                      return msg["chat"]["id"]
+              log("  -> No chats found. Open Telegram, send any message to the bot, then re-run this workflow.")
               return None
 
           def send_telegram(text):
@@ -59,24 +73,53 @@ jobs:
                   return True
               log(f"Telegram send to {CHAT_ID!r} failed ({code}): {data.get('description')}")
               alt = resolve_chat_id()
-              if alt and str(alt) != str(CHAT_ID):
+              if alt and str(alt) != CHAT_ID:
                   log(f"Retrying with chat id {alt} (found via getUpdates)")
                   code, data = tg("sendMessage", {"chat_id": alt, "text": text})
                   if code == 200 and data.get("ok"):
-                      log(f"Telegram message sent to {alt}. TIP: set the TELEGRAM_CHAT_ID secret to {alt}")
+                      log(f"Telegram message sent to {alt}.")
+                      log(f"  -> Set the TELEGRAM_CHAT_ID secret to {alt} so this is permanent.")
                       return True
                   log(f"Retry failed ({code}): {data.get('description')}")
               return False
 
-          def write_heartbeat(detail, verdict="landed"):
+          # ---------- Supabase ----------
+          def discover_leads_table():
+              """Read the API schema, log every table, and pick the leads table + its columns."""
+              r = requests.get(f"{SUPABASE_URL}/rest/v1/", headers=sb_headers(), timeout=20)
+              r.raise_for_status()
+              spec = r.json()
+              defs = spec.get("definitions", {})
+              tables = sorted(defs.keys())
+              log(f"Tables visible to this key: {', '.join(tables) or '(none)'}")
+
+              def cols(t):
+                  return list(defs.get(t, {}).get("properties", {}).keys())
+
+              candidates = [t for t in tables if "email_sent_at" in cols(t)]
+              if not candidates:
+                  candidates = [t for t in tables if re.search(r"lead|enquir|inquir|submission|contact", t, re.I)]
+              if not candidates:
+                  raise RuntimeError("no table looks like a leads table (none has an email_sent_at column or a lead-like name)")
+              table = "leads" if "leads" in candidates else candidates[0]
+              c = cols(table)
+              created = next((x for x in ("created_at", "inserted_at", "submitted_at") if x in c), None)
+              sent = "email_sent_at" if "email_sent_at" in c else next((x for x in c if "email" in x and x.endswith("_at")), None)
+              log(f"Using table '{table}' (created column: {created}, email-sent column: {sent})")
+              log(f"  columns: {', '.join(c)}")
+              if not created or not sent:
+                  raise RuntimeError(f"table '{table}' has no created/email-sent timestamp columns I recognise")
+              return table, created, sent
+
+          def write_heartbeat(detail):
               now = datetime.now(timezone.utc).isoformat()
               row = {
                   "agent_name": "LEAD DELIVERY HEARTBEAT",
                   "due_at": now,
-                  "verdict": verdict,
+                  "verdict": "landed",
                   "artifact_ref": "heartbeat",
                   "artifact_at": now,
-                  "detail": detail,
+                  "detail": detail[:500],
                   "checked_at": now,
               }
               r = requests.post(f"{SUPABASE_URL}/rest/v1/agent_runs", json=row,
@@ -85,9 +128,10 @@ jobs:
               if r.status_code in (200, 201, 204):
                   log(f"Heartbeat written: {detail}")
                   return True
-              log(f"Heartbeat write failed ({r.status_code}): {r.text[:300]}")
+              log(f"Heartbeat write failed ({r.status_code}): {r.text[:800]}")
               return False
 
+          # ---------- main ----------
           def main():
               log("=" * 60)
               log("LEAD DELIVERY WATCHDOG - STARTING")
@@ -98,54 +142,60 @@ jobs:
                   log(f"FATAL: missing secrets: {', '.join(missing)}")
                   sys.exit(1)
 
+              tg_ok = telegram_token_ok()
+
               now = datetime.now(timezone.utc)
               window_start = (now - timedelta(hours=26)).isoformat()
               grace_cutoff = (now - timedelta(minutes=15)).isoformat()
 
-              # STEP 1: all leads created in the last 26 hours
               log("STEP 1: Querying leads from the last 26 hours...")
+              leads, stuck = [], []
               try:
-                  r = requests.get(f"{SUPABASE_URL}/rest/v1/leads",
-                                   params={"select": "id,first_name,last_name,phone,form_type,created_at,email_sent_at",
-                                           "created_at": f"gte.{window_start}", "order": "created_at.desc"},
+                  table, created_col, sent_col = discover_leads_table()
+                  r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}",
+                                   params={"select": "*", created_col: f"gte.{window_start}", "order": f"{created_col}.desc"},
                                    headers=sb_headers(), timeout=20)
                   r.raise_for_status()
                   leads = r.json()
+                  # Stuck = no email sent AND older than the 15-minute grace period
+                  stuck = [l for l in leads if l.get(sent_col) is None and (l.get(created_col) or "") <= grace_cutoff]
+                  log(f"Checked {len(leads)} leads, found {len(stuck)} stuck")
               except Exception as e:
-                  log(f"FATAL: could not query leads: {e}")
-                  send_telegram(f"Watchdog ERROR: could not query the leads table: {e}")
-                  write_heartbeat(f"query failed: {e}", verdict="missed")
-                  sys.exit(1)
+                  log(f"Could not query leads: {e}")
+                  problems.append(f"could not query leads: {e}")
 
-              # A lead is stuck if no email was sent AND it's older than 15 minutes (grace period)
-              stuck = [l for l in leads if l.get("email_sent_at") is None and (l.get("created_at") or "") <= grace_cutoff]
-              log(f"Checked {len(leads)} leads, found {len(stuck)} stuck")
-
-              # STEP 2: Telegram alert if needed
               alert_ok = True
-              if stuck:
-                  lines = [f"- {l.get('first_name') or ''} {l.get('last_name') or ''} - {l.get('phone') or 'no phone'} ({l.get('form_type') or 'form'})".strip()
-                           for l in stuck[:5]]
+              if problems:
+                  log("STEP 2: Reporting problems to Telegram...")
+                  alert_ok = tg_ok and send_telegram("Watchdog ERROR:\n- " + "\n- ".join(problems))
+              elif stuck:
+                  log(f"STEP 2: Sending Telegram alert for {len(stuck)} stuck lead(s)...")
+                  lines = []
+                  for l in stuck[:5]:
+                      name = " ".join(x for x in (l.get("first_name"), l.get("last_name"), l.get("name")) if x) or "Unknown"
+                      lines.append(f"- {name} - {l.get('phone') or l.get('email') or 'no contact'} ({l.get('form_type') or 'form'})")
                   if len(stuck) > 5:
                       lines.append(f"... and {len(stuck) - 5} more")
                   text = ("ALERT: Website leads stuck undelivered\n\n"
                           f"{len(stuck)} lead(s) in the last 26 hours never emailed:\n\n" + "\n".join(lines) +
                           "\n\nThese did NOT reach your inbox. Check /admin or ring them back.")
-                  log(f"STEP 2: Sending Telegram alert for {len(stuck)} stuck lead(s)...")
-                  alert_ok = send_telegram(text)
+                  alert_ok = tg_ok and send_telegram(text)
               else:
                   log("STEP 2: No stuck leads, no alert needed")
 
-              # STEP 3: heartbeat (always)
               log("STEP 3: Writing heartbeat...")
-              alert_word = "sent" if (stuck and alert_ok) else ("FAILED" if stuck else "not needed")
-              hb_ok = write_heartbeat(f"{len(leads)} leads checked, {len(stuck)} stuck, alert {alert_word}")
+              if problems:
+                  detail = "watchdog ran with problems: " + "; ".join(problems)
+              else:
+                  alert_word = "sent" if (stuck and alert_ok) else ("FAILED" if stuck else "not needed")
+                  detail = f"{len(leads)} leads checked, {len(stuck)} stuck, alert {alert_word}"
+              hb_ok = write_heartbeat(detail)
 
               log("=" * 60)
-              log("LEAD DELIVERY WATCHDOG - COMPLETE")
+              log("LEAD DELIVERY WATCHDOG - COMPLETE" if (not problems and alert_ok and hb_ok) else "LEAD DELIVERY WATCHDOG - FINISHED WITH ERRORS (see above)")
               log("=" * 60)
-              # Never end silently: a failed alert or heartbeat fails the run, and GitHub emails the repo owner.
-              if not alert_ok or not hb_ok:
+              # Never end silently: any failure fails the run, and GitHub emails the repo owner.
+              if problems or not alert_ok or not hb_ok:
                   sys.exit(1)
 
           main()
