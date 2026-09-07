@@ -13,11 +13,11 @@ jobs:
       # CRM database (heartbeat lives here, in agent_runs)
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-      # Website database (where the leads table lives). If these are blank, the CRM database is used.
+      # Website database (where the leads table lives). Both have public built-in defaults below;
+      # these secrets only override them.
       LEADS_SUPABASE_URL: ${{ secrets.LEADS_SUPABASE_URL }}
       LEADS_SUPABASE_KEY: ${{ secrets.LEADS_SUPABASE_KEY }}
-      # Optional: log in to the website database as an admin user instead of using a master key.
-      # When these are set, LEADS_SUPABASE_KEY should be the public (anon/publishable) key.
+      # Log in to the website database as an admin user (no master key needed).
       LEADS_ADMIN_EMAIL: ${{ secrets.LEADS_ADMIN_EMAIL }}
       LEADS_ADMIN_PASSWORD: ${{ secrets.LEADS_ADMIN_PASSWORD }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -29,7 +29,7 @@ jobs:
       - name: Run Lead Delivery Watchdog
         run: |
           python3 - <<'PYEOF'
-          import os, sys, re, json, requests
+          import os, sys, re, json, base64, requests
           from datetime import datetime, timedelta, timezone
 
           def log(msg):
@@ -46,11 +46,42 @@ jobs:
                   log(f"Cleaned {dropped} hidden/invisible character(s) out of the {name} secret")
               return cleaned
 
+          # The website's Supabase project. The URL and the anon ("publishable") key are PUBLIC values:
+          # they ship in the site's own .env and to every visitor's browser. Building them in here means
+          # nobody has to paste a 208-character key by hand. A pasted secret still wins if it is valid.
+          WEBSITE_PROJECT_REF = "kmxriwfsuvrdwjbwfloh"
+          WEBSITE_URL = f"https://{WEBSITE_PROJECT_REF}.supabase.co"
+          WEBSITE_ANON_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                              "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtteHJpd2ZzdXZyZHdqYndmbG9oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwMzI5NTEsImV4cCI6MjA4ODYwODk1MX0."
+                              "i9zqQJ-_BUm_DFpALeuGV6Yg-kvQE6qnF4R9SVWxvH0")
+          WATCHDOG_EMAIL = "sunrisecaravans+watchdog@gmail.com"
+
+          def jwt_claims(token):
+              try:
+                  part = token.split(".")[1]
+                  part += "=" * (-len(part) % 4)
+                  return json.loads(base64.urlsafe_b64decode(part))
+              except Exception:
+                  return None
+
           CRM_URL = env("SUPABASE_URL").rstrip("/")
           CRM_KEY = env("SUPABASE_SECRET_KEY")
-          LEADS_URL = (env("LEADS_SUPABASE_URL") or CRM_URL).rstrip("/")
-          LEADS_KEY = env("LEADS_SUPABASE_KEY") or CRM_KEY
-          LEADS_ADMIN_EMAIL = env("LEADS_ADMIN_EMAIL")
+
+          LEADS_URL = (env("LEADS_SUPABASE_URL") or WEBSITE_URL).rstrip("/")
+          if LEADS_URL != WEBSITE_URL:
+              log(f"Using the LEADS_SUPABASE_URL secret instead of the built-in website address")
+
+          pasted_key = env("LEADS_SUPABASE_KEY")
+          claims = jwt_claims(pasted_key) if pasted_key else None
+          if pasted_key and claims and claims.get("ref") == WEBSITE_PROJECT_REF and claims.get("role") == "anon":
+              LEADS_KEY = pasted_key
+          else:
+              if pasted_key:
+                  log("The pasted LEADS_SUPABASE_KEY secret is damaged (it does not decode as this website's public key). "
+                      "Using the built-in public key instead - you can delete that secret.")
+              LEADS_KEY = WEBSITE_ANON_KEY
+
+          LEADS_ADMIN_EMAIL = env("LEADS_ADMIN_EMAIL") or WATCHDOG_EMAIL
           LEADS_ADMIN_PASSWORD = env("LEADS_ADMIN_PASSWORD")
           BOT_TOKEN = re.sub(r"^bot", "", env("TELEGRAM_BOT_TOKEN"))
           CHAT_ID = env("TELEGRAM_CHAT_ID")
@@ -105,9 +136,9 @@ jobs:
                       log(f"Found the right spelling by trying look-alike letters (I/l, O/0). Bot: @{data['result'].get('username')}")
                       # Never print the working token here: GitHub only masks the exact stored secret,
                       # so a corrected variant would land in the log in plain text.
-                      log("  -> The stored TELEGRAM_BOT_TOKEN has a look-alike-letter typo. Fix: GitHub repo > Settings >")
-                      log("     Secrets and variables > Actions > TELEGRAM_BOT_TOKEN > Update, and paste the token")
-                      log("     straight from @BotFather (tap it in Telegram to copy) rather than retyping it.")
+                      log("  -> The stored TELEGRAM_BOT_TOKEN has a look-alike-letter typo. It still works, but to stop this")
+                      log("     search every run: GitHub repo > Settings > Secrets and variables > Actions > TELEGRAM_BOT_TOKEN >")
+                      log("     Update, and paste the token straight from @BotFather (tap it in Telegram to copy) rather than retyping it.")
                       return True
               BOT_TOKEN = original
               log("  -> No spelling of this token works. Fix: GitHub repo > Settings > Secrets and variables > Actions >")
@@ -150,22 +181,32 @@ jobs:
               return r.json().get("definitions", {})
 
           def leads_headers():
-              """Headers for the leads database. With an admin login configured, sign in through
-              Supabase Auth using the public key and use that user's session token. Without one,
-              fall back to treating LEADS_KEY as a key that can read the table directly."""
-              if not (LEADS_ADMIN_EMAIL and LEADS_ADMIN_PASSWORD):
-                  return hdr(LEADS_KEY)
+              """Headers for the leads database: sign in as the watchdog admin user through Supabase Auth
+              using the public key, then use that user's session token."""
+              if not LEADS_ADMIN_PASSWORD:
+                  raise RuntimeError("the LEADS_ADMIN_PASSWORD secret is empty - add it in GitHub > Settings > Secrets and variables > Actions")
               r = requests.post(f"{LEADS_URL}/auth/v1/token", params={"grant_type": "password"},
                                 json={"email": LEADS_ADMIN_EMAIL, "password": LEADS_ADMIN_PASSWORD},
                                 headers={"apikey": LEADS_KEY, "Content-Type": "application/json"}, timeout=20)
-              token = None
+              body = {}
               try:
-                  token = r.json().get("access_token")
+                  body = r.json()
               except Exception:
                   pass
+              token = body.get("access_token")
               if r.status_code != 200 or not token:
-                  raise RuntimeError(f"admin login to the leads database failed ({r.status_code}). "
-                                     "Check the LEADS_ADMIN_EMAIL and LEADS_ADMIN_PASSWORD secrets")
+                  reason = body.get("error_description") or body.get("msg") or body.get("message") or body.get("error") or r.text[:200]
+                  log(f"Admin login failed ({r.status_code}): {reason}")
+                  log(f"  email used: {LEADS_ADMIN_EMAIL}   password length: {len(LEADS_ADMIN_PASSWORD)} characters (expected 24)")
+                  if "api key" in str(reason).lower():
+                      hint = "the website key is wrong - delete the LEADS_SUPABASE_KEY secret so the built-in one is used"
+                  elif len(LEADS_ADMIN_PASSWORD) != 24:
+                      hint = "the LEADS_ADMIN_PASSWORD secret has the wrong number of characters - re-paste it, nothing else in the box"
+                  elif LEADS_ADMIN_EMAIL != WATCHDOG_EMAIL:
+                      hint = f"the LEADS_ADMIN_EMAIL secret should be exactly {WATCHDOG_EMAIL}"
+                  else:
+                      hint = "re-paste the LEADS_ADMIN_PASSWORD secret (only the password, no spaces or quotes)"
+                  raise RuntimeError(f"admin login to the leads database failed: {reason}. Fix: {hint}")
               log(f"Logged in to the leads database as {LEADS_ADMIN_EMAIL}")
               return {"apikey": LEADS_KEY, "Authorization": f"Bearer {token}"}
 
@@ -280,7 +321,7 @@ jobs:
               if missing:
                   log(f"FATAL: missing secrets: {', '.join(missing)}")
                   sys.exit(1)
-              log(f"Leads database: {LEADS_URL}{'  (same as CRM - set LEADS_SUPABASE_URL/KEY if leads live elsewhere)' if LEADS_URL == CRM_URL else ''}")
+              log(f"Leads database: {LEADS_URL}")
 
               tg_ok = telegram_token_ok()
 
@@ -313,8 +354,7 @@ jobs:
                   log(f"Checked {len(leads)} leads, found {len(stuck)} stuck")
               except UnicodeEncodeError as e:
                   log("Could not query leads: a secret still contains characters that are not plain text.")
-                  log("  -> Re-paste LEADS_SUPABASE_KEY (and LEADS_SUPABASE_URL) in GitHub > Settings > Secrets, copying from a plain source.")
-                  problems.append("could not query leads: a secret contains hidden characters - re-paste LEADS_SUPABASE_KEY")
+                  problems.append("could not query leads: a secret contains hidden characters - re-paste it")
               except Exception as e:
                   log(f"Could not query leads: {e}")
                   problems.append(f"could not query leads: {e}")
