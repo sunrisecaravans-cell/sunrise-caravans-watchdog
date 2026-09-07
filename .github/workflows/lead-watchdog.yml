@@ -1,0 +1,152 @@
+name: Lead Delivery Watchdog
+
+on:
+  schedule:
+    # 22:00 UTC = 8:00 AM Brisbane (AEST, UTC+10)
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Lead Delivery Watchdog
+        run: |
+          python3 - <<'PYEOF'
+          import os, sys, requests
+          from datetime import datetime, timedelta, timezone
+
+          SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+          SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") or ""
+          BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+          CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or ""
+
+          def log(msg):
+              print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
+
+          def sb_headers():
+              return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+          def tg(method, payload):
+              r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload, timeout=15)
+              return r.status_code, r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+
+          def resolve_chat_id():
+              # If the configured chat id is a bot username (e.g. @SunriseContentBot), it can't receive
+              # messages. Fall back to the most recent chat that has messaged the bot.
+              try:
+                  code, data = tg("getUpdates", {"limit": 100})
+                  for upd in reversed(data.get("result", [])):
+                      msg = upd.get("message") or upd.get("channel_post") or {}
+                      if msg.get("chat", {}).get("id"):
+                          return msg["chat"]["id"]
+              except Exception as e:
+                  log(f"getUpdates failed: {e}")
+              return None
+
+          def send_telegram(text):
+              code, data = tg("sendMessage", {"chat_id": CHAT_ID, "text": text})
+              if code == 200 and data.get("ok"):
+                  log("Telegram message sent")
+                  return True
+              log(f"Telegram send to {CHAT_ID!r} failed ({code}): {data.get('description')}")
+              alt = resolve_chat_id()
+              if alt and str(alt) != str(CHAT_ID):
+                  log(f"Retrying with chat id {alt} (found via getUpdates)")
+                  code, data = tg("sendMessage", {"chat_id": alt, "text": text})
+                  if code == 200 and data.get("ok"):
+                      log(f"Telegram message sent to {alt}. TIP: set the TELEGRAM_CHAT_ID secret to {alt}")
+                      return True
+                  log(f"Retry failed ({code}): {data.get('description')}")
+              return False
+
+          def write_heartbeat(detail, verdict="landed"):
+              now = datetime.now(timezone.utc).isoformat()
+              row = {
+                  "agent_name": "LEAD DELIVERY HEARTBEAT",
+                  "due_at": now,
+                  "verdict": verdict,
+                  "artifact_ref": "heartbeat",
+                  "artifact_at": now,
+                  "detail": detail,
+                  "checked_at": now,
+              }
+              r = requests.post(f"{SUPABASE_URL}/rest/v1/agent_runs", json=row,
+                                headers={**sb_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+                                timeout=20)
+              if r.status_code in (200, 201, 204):
+                  log(f"Heartbeat written: {detail}")
+                  return True
+              log(f"Heartbeat write failed ({r.status_code}): {r.text[:300]}")
+              return False
+
+          def main():
+              log("=" * 60)
+              log("LEAD DELIVERY WATCHDOG - STARTING")
+              log("=" * 60)
+              missing = [k for k, v in {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_SECRET_KEY": SUPABASE_KEY,
+                                        "TELEGRAM_BOT_TOKEN": BOT_TOKEN, "TELEGRAM_CHAT_ID": CHAT_ID}.items() if not v]
+              if missing:
+                  log(f"FATAL: missing secrets: {', '.join(missing)}")
+                  sys.exit(1)
+
+              now = datetime.now(timezone.utc)
+              window_start = (now - timedelta(hours=26)).isoformat()
+              grace_cutoff = (now - timedelta(minutes=15)).isoformat()
+
+              # STEP 1: all leads created in the last 26 hours
+              log("STEP 1: Querying leads from the last 26 hours...")
+              try:
+                  r = requests.get(f"{SUPABASE_URL}/rest/v1/leads",
+                                   params={"select": "id,first_name,last_name,phone,form_type,created_at,email_sent_at",
+                                           "created_at": f"gte.{window_start}", "order": "created_at.desc"},
+                                   headers=sb_headers(), timeout=20)
+                  r.raise_for_status()
+                  leads = r.json()
+              except Exception as e:
+                  log(f"FATAL: could not query leads: {e}")
+                  send_telegram(f"Watchdog ERROR: could not query the leads table: {e}")
+                  write_heartbeat(f"query failed: {e}", verdict="missed")
+                  sys.exit(1)
+
+              # A lead is stuck if no email was sent AND it's older than 15 minutes (grace period)
+              stuck = [l for l in leads if l.get("email_sent_at") is None and (l.get("created_at") or "") <= grace_cutoff]
+              log(f"Checked {len(leads)} leads, found {len(stuck)} stuck")
+
+              # STEP 2: Telegram alert if needed
+              alert_ok = True
+              if stuck:
+                  lines = [f"- {l.get('first_name') or ''} {l.get('last_name') or ''} - {l.get('phone') or 'no phone'} ({l.get('form_type') or 'form'})".strip()
+                           for l in stuck[:5]]
+                  if len(stuck) > 5:
+                      lines.append(f"... and {len(stuck) - 5} more")
+                  text = ("ALERT: Website leads stuck undelivered\n\n"
+                          f"{len(stuck)} lead(s) in the last 26 hours never emailed:\n\n" + "\n".join(lines) +
+                          "\n\nThese did NOT reach your inbox. Check /admin or ring them back.")
+                  log(f"STEP 2: Sending Telegram alert for {len(stuck)} stuck lead(s)...")
+                  alert_ok = send_telegram(text)
+              else:
+                  log("STEP 2: No stuck leads, no alert needed")
+
+              # STEP 3: heartbeat (always)
+              log("STEP 3: Writing heartbeat...")
+              alert_word = "sent" if (stuck and alert_ok) else ("FAILED" if stuck else "not needed")
+              hb_ok = write_heartbeat(f"{len(leads)} leads checked, {len(stuck)} stuck, alert {alert_word}")
+
+              log("=" * 60)
+              log("LEAD DELIVERY WATCHDOG - COMPLETE")
+              log("=" * 60)
+              # Never end silently: a failed alert or heartbeat fails the run, and GitHub emails the repo owner.
+              if not alert_ok or not hb_ok:
+                  sys.exit(1)
+
+          main()
+          PYEOF
