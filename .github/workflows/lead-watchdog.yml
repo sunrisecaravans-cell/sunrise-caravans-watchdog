@@ -13,12 +13,12 @@ jobs:
       # CRM database (heartbeat lives here, in agent_runs)
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-      # Website database (where the leads table lives). Both have public built-in defaults below;
-      # these secrets only override them.
+      # Website database (where the leads table lives). If these are blank, the CRM database is used.
       LEADS_SUPABASE_URL: ${{ secrets.LEADS_SUPABASE_URL }}
       LEADS_SUPABASE_KEY: ${{ secrets.LEADS_SUPABASE_KEY }}
-      # Password for the watchdog's own login on the website (sunrisecaravans+watchdog@gmail.com).
-      LEADS_ADMIN_PASSWORD: ${{ secrets.LEADS_ADMIN_PASSWORD }}
+      # OR: a status endpoint on the website itself (built by Lovable) - used if set
+      LEADS_STATUS_URL: ${{ secrets.LEADS_STATUS_URL }}
+      LEADS_STATUS_KEY: ${{ secrets.LEADS_STATUS_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
@@ -28,65 +28,25 @@ jobs:
       - name: Run Lead Delivery Watchdog
         run: |
           python3 - <<'PYEOF'
-          import os, sys, re, json, base64, requests
+          import os, sys, re, json, requests
           from datetime import datetime, timedelta, timezone
 
-          def log(msg):
-              print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
-
           def env(name):
-              raw = os.getenv(name) or ""
-              # Phones and chat apps sneak invisible characters (zero-width spaces, non-breaking
-              # spaces, smart quotes) into pasted secrets. Every value read here is plain printable
-              # ASCII with no spaces, so anything else is junk: drop it and say how much was dropped.
-              cleaned = "".join(ch for ch in raw if 0x21 <= ord(ch) <= 0x7E)
-              dropped = len(raw) - len(cleaned)
-              if dropped and raw.strip() != cleaned:
-                  log(f"Cleaned {dropped} hidden/invisible character(s) out of the {name} secret")
-              return cleaned
-
-          # The website's Supabase project. The URL and the anon ("publishable") key are PUBLIC values:
-          # they ship in the site's own .env and to every visitor's browser. Building them in here means
-          # nobody has to paste a 208-character key by hand. A pasted secret still wins if it is valid.
-          WEBSITE_PROJECT_REF = "kmxriwfsuvrdwjbwfloh"
-          WEBSITE_URL = f"https://{WEBSITE_PROJECT_REF}.supabase.co"
-          WEBSITE_ANON_KEY = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-                              "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtteHJpd2ZzdXZyZHdqYndmbG9oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMwMzI5NTEsImV4cCI6MjA4ODYwODk1MX0."
-                              "i9zqQJ-_BUm_DFpALeuGV6Yg-kvQE6qnF4R9SVWxvH0")
-          # The watchdog's own admin login on the website. It has exactly one, so it is built in.
-          WATCHDOG_EMAIL = "sunrisecaravans+watchdog@gmail.com"
-
-          def jwt_claims(token):
-              try:
-                  part = token.split(".")[1]
-                  part += "=" * (-len(part) % 4)
-                  return json.loads(base64.urlsafe_b64decode(part))
-              except Exception:
-                  return None
+              return (os.getenv(name) or "").strip()
 
           CRM_URL = env("SUPABASE_URL").rstrip("/")
           CRM_KEY = env("SUPABASE_SECRET_KEY")
-
-          LEADS_URL = (env("LEADS_SUPABASE_URL") or WEBSITE_URL).rstrip("/")
-          if LEADS_URL != WEBSITE_URL:
-              log(f"Using the LEADS_SUPABASE_URL secret instead of the built-in website address")
-
-          pasted_key = env("LEADS_SUPABASE_KEY")
-          claims = jwt_claims(pasted_key) if pasted_key else None
-          if pasted_key and claims and claims.get("ref") == WEBSITE_PROJECT_REF and claims.get("role") == "anon":
-              LEADS_KEY = pasted_key
-          else:
-              if pasted_key:
-                  log("The pasted LEADS_SUPABASE_KEY secret is damaged (it does not decode as this website's public key). "
-                      "Using the built-in public key instead - you can delete that secret.")
-              LEADS_KEY = WEBSITE_ANON_KEY
-
-          LEADS_ADMIN_EMAIL = WATCHDOG_EMAIL
-          LEADS_ADMIN_PASSWORD = env("LEADS_ADMIN_PASSWORD")
+          LEADS_URL = (env("LEADS_SUPABASE_URL") or CRM_URL).rstrip("/")
+          LEADS_KEY = env("LEADS_SUPABASE_KEY") or CRM_KEY
+          STATUS_URL = env("LEADS_STATUS_URL")
+          STATUS_KEY = env("LEADS_STATUS_KEY")
           BOT_TOKEN = re.sub(r"^bot", "", env("TELEGRAM_BOT_TOKEN"))
           CHAT_ID = env("TELEGRAM_CHAT_ID")
           AGENT_NAME = "LEAD DELIVERY HEARTBEAT"
           problems = []
+
+          def log(msg):
+              print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
 
           def hdr(key, **extra):
               return {"apikey": key, "Authorization": f"Bearer {key}", **extra}
@@ -117,12 +77,6 @@ jobs:
 
           def telegram_token_ok():
               global BOT_TOKEN
-              if not re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{30,}", BOT_TOKEN):
-                  log("Telegram bot token is not the right shape. It should look like 1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
-                  log("  -> Fix: GitHub repo > Settings > Secrets and variables > Actions > TELEGRAM_BOT_TOKEN > Update,")
-                  log("     and paste ONLY the token from @BotFather (tap it in Telegram to copy) - no other words.")
-                  problems.append("Telegram bot token is wrong")
-                  return False
               code, data = tg("getMe", {})
               if code == 200 and data.get("ok"):
                   log(f"Telegram bot token OK (bot: @{data['result'].get('username')})")
@@ -134,11 +88,7 @@ jobs:
                   code, data = tg("getMe", {})
                   if code == 200 and data.get("ok"):
                       log(f"Found the right spelling by trying look-alike letters (I/l, O/0). Bot: @{data['result'].get('username')}")
-                      # Never print the working token here: GitHub only masks the exact stored secret,
-                      # so a corrected variant would land in the log in plain text.
-                      log("  -> The stored TELEGRAM_BOT_TOKEN has a look-alike-letter typo. It still works, but to stop this")
-                      log("     search every run: GitHub repo > Settings > Secrets and variables > Actions > TELEGRAM_BOT_TOKEN >")
-                      log("     Update, and paste the token straight from @BotFather (tap it in Telegram to copy) rather than retyping it.")
+                      log(f"  -> Update the TELEGRAM_BOT_TOKEN secret to exactly:  {cand}")
                       return True
               BOT_TOKEN = original
               log("  -> No spelling of this token works. Fix: GitHub repo > Settings > Secrets and variables > Actions >")
@@ -175,38 +125,10 @@ jobs:
               return False
 
           # ---------- Supabase helpers ----------
-          def schema(url, headers):
-              r = requests.get(f"{url}/rest/v1/", headers=headers, timeout=20)
+          def schema(url, key):
+              r = requests.get(f"{url}/rest/v1/", headers=hdr(key), timeout=20)
               r.raise_for_status()
               return r.json().get("definitions", {})
-
-          def leads_headers():
-              """Headers for the leads database: sign in as the watchdog admin user through Supabase Auth
-              using the public key, then use that user's session token."""
-              if not LEADS_ADMIN_PASSWORD:
-                  raise RuntimeError("the LEADS_ADMIN_PASSWORD secret is empty - add it in GitHub > Settings > Secrets and variables > Actions")
-              r = requests.post(f"{LEADS_URL}/auth/v1/token", params={"grant_type": "password"},
-                                json={"email": LEADS_ADMIN_EMAIL, "password": LEADS_ADMIN_PASSWORD},
-                                headers={"apikey": LEADS_KEY, "Content-Type": "application/json"}, timeout=20)
-              body = {}
-              try:
-                  body = r.json()
-              except Exception:
-                  pass
-              token = body.get("access_token")
-              if r.status_code != 200 or not token:
-                  reason = body.get("error_description") or body.get("msg") or body.get("message") or body.get("error") or r.text[:200]
-                  log(f"Admin login failed ({r.status_code}): {reason}")
-                  log(f"  email used: {LEADS_ADMIN_EMAIL}   password length: {len(LEADS_ADMIN_PASSWORD)} characters (expected 24)")
-                  if "api key" in str(reason).lower():
-                      hint = "the website key is wrong - delete the LEADS_SUPABASE_KEY secret so the built-in one is used"
-                  elif len(LEADS_ADMIN_PASSWORD) != 24:
-                      hint = "the LEADS_ADMIN_PASSWORD secret has the wrong number of characters - re-paste it, nothing else in the box"
-                  else:
-                      hint = "re-paste the LEADS_ADMIN_PASSWORD secret (only the password, no spaces or quotes)"
-                  raise RuntimeError(f"admin login to the leads database failed: {reason}. Fix: {hint}")
-              log(f"Logged in to the leads database as {LEADS_ADMIN_EMAIL}")
-              return {"apikey": LEADS_KEY, "Authorization": f"Bearer {token}"}
 
           def discover_leads_table(defs):
               tables = sorted(defs.keys())
@@ -319,14 +241,17 @@ jobs:
               if missing:
                   log(f"FATAL: missing secrets: {', '.join(missing)}")
                   sys.exit(1)
-              log(f"Leads database: {LEADS_URL}")
+              if STATUS_URL:
+                  log(f"Leads source: website status endpoint {STATUS_URL}")
+              else:
+                  log(f"Leads database: {LEADS_URL}{'  (same as CRM - set LEADS_STATUS_URL/KEY or LEADS_SUPABASE_URL/KEY for the website)' if LEADS_URL == CRM_URL else ''}")
 
               tg_ok = telegram_token_ok()
 
               log("STEP 0: Checking heartbeat registration...")
               crm_defs = None
               try:
-                  crm_defs = schema(CRM_URL, hdr(CRM_KEY))
+                  crm_defs = schema(CRM_URL, CRM_KEY)
                   ensure_registered(crm_defs)
               except Exception as e:
                   log(f"Could not read CRM schema: {e}")
@@ -339,37 +264,26 @@ jobs:
               log("STEP 1: Querying leads from the last 26 hours...")
               leads, stuck = [], []
               try:
-                  leads_hdr = leads_headers()
-                  # The website's leads table is known (public.leads with created_at / email_sent_at), so ask
-                  # for it directly. The website refuses the /rest/v1/ "list every table" request with 401
-                  # even for a logged-in admin, so only fall back to that discovery if the table has moved.
-                  table, created_col, sent_col = "leads", "created_at", "email_sent_at"
-                  def fetch(table, created_col):
-                      return requests.get(f"{LEADS_URL}/rest/v1/{table}",
-                                          params={"select": "*", created_col: f"gte.{window_start}", "order": f"{created_col}.desc"},
-                                          headers=leads_hdr, timeout=20)
-                  r = fetch(table, created_col)
-                  if r.status_code == 404:
-                      log("The 'leads' table was not found - asking the database what tables it has...")
-                      leads_defs = crm_defs if (LEADS_URL == CRM_URL and crm_defs is not None) else schema(LEADS_URL, leads_hdr)
-                      table, created_col, sent_col = discover_leads_table(leads_defs)
-                      r = fetch(table, created_col)
+                if STATUS_URL:
+                  # The website exposes a locked endpoint that does the query for us (built by Lovable).
+                  r = requests.get(STATUS_URL, headers={"x-watchdog-key": STATUS_KEY, "Accept": "application/json"}, timeout=30)
                   if r.status_code != 200:
-                      reason = r.text[:300]
-                      if r.status_code in (401, 403):
-                          hint = ("the watchdog login is not allowed to read leads - check the account still has the "
-                                  "admin role in user_roles on the website database")
-                      else:
-                          hint = "see the response above"
-                      raise RuntimeError(f"the leads database refused the query ({r.status_code}): {reason}. Fix: {hint}")
+                      raise RuntimeError(f"status endpoint returned {r.status_code}: {r.text[:200]}")
+                  data = r.json()
+                  stuck = data.get("stuck") or []
+                  leads = data.get("leads") or [None] * int(data.get("checked") or len(stuck))
+                  log(f"Website reports {len(leads)} leads in the last 26 hours, {len(stuck)} stuck")
+                else:
+                  leads_defs = crm_defs if (LEADS_URL == CRM_URL and crm_defs is not None) else schema(LEADS_URL, LEADS_KEY)
+                  table, created_col, sent_col = discover_leads_table(leads_defs)
+                  r = requests.get(f"{LEADS_URL}/rest/v1/{table}",
+                                   params={"select": "*", created_col: f"gte.{window_start}", "order": f"{created_col}.desc"},
+                                   headers=hdr(LEADS_KEY), timeout=20)
+                  r.raise_for_status()
                   leads = r.json()
-                  log(f"Read {len(leads)} lead(s) from '{table}' created since {window_start[:19]} UTC")
                   # Stuck = no email sent AND older than the 15-minute grace period
                   stuck = [l for l in leads if l.get(sent_col) is None and (l.get(created_col) or "") <= grace_cutoff]
                   log(f"Checked {len(leads)} leads, found {len(stuck)} stuck")
-              except UnicodeEncodeError as e:
-                  log("Could not query leads: a secret still contains characters that are not plain text.")
-                  problems.append("could not query leads: a secret contains hidden characters - re-paste it")
               except Exception as e:
                   log(f"Could not query leads: {e}")
                   problems.append(f"could not query leads: {e}")
