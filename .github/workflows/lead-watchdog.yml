@@ -88,7 +88,9 @@ jobs:
                   code, data = tg("getMe", {})
                   if code == 200 and data.get("ok"):
                       log(f"Found the right spelling by trying look-alike letters (I/l, O/0). Bot: @{data['result'].get('username')}")
-                      log(f"  -> Update the TELEGRAM_BOT_TOKEN secret to exactly:  {cand}")
+                      log("  -> The stored secret has look-alike letters (I/l or O/0). It works for now, but fix it:")
+                      log("     GitHub repo > Settings > Secrets and variables > Actions > TELEGRAM_BOT_TOKEN > Update,")
+                      log("     and paste the token from @BotFather (tap it in Telegram to copy - don't retype it).")
                       return True
               BOT_TOKEN = original
               log("  -> No spelling of this token works. Fix: GitHub repo > Settings > Secrets and variables > Actions >")
