@@ -263,8 +263,23 @@ jobs:
               window_start = (now - timedelta(hours=26)).isoformat()
               grace_cutoff = (now - timedelta(minutes=15)).isoformat()
 
+              def query_leads_directly():
+                  leads_defs = crm_defs if (LEADS_URL == CRM_URL and crm_defs is not None) else schema(LEADS_URL, LEADS_KEY)
+                  table, created_col, sent_col = discover_leads_table(leads_defs)
+                  r = requests.get(f"{LEADS_URL}/rest/v1/{table}",
+                                   params={"select": "*", created_col: f"gte.{window_start}", "order": f"{created_col}.desc"},
+                                   headers=hdr(LEADS_KEY), timeout=20)
+                  r.raise_for_status()
+                  found = r.json()
+                  # Stuck = no email sent AND older than the 15-minute grace period
+                  found_stuck = [l for l in found if l.get(sent_col) is None and (l.get(created_col) or "") <= grace_cutoff]
+                  log(f"Checked {len(found)} leads directly, found {len(found_stuck)} stuck")
+                  return found, found_stuck
+
               log("STEP 1: Querying leads from the last 26 hours...")
               leads, stuck = [], []
+              status_endpoint_error = None
+              checked_ok = False
               try:
                 if STATUS_URL:
                   # The website exposes a locked endpoint that does the query for us (built by Lovable).
@@ -275,26 +290,32 @@ jobs:
                   stuck = data.get("stuck") or []
                   leads = data.get("leads") or [None] * int(data.get("checked") or len(stuck))
                   log(f"Website reports {len(leads)} leads in the last 26 hours, {len(stuck)} stuck")
+                  checked_ok = True
                 else:
-                  leads_defs = crm_defs if (LEADS_URL == CRM_URL and crm_defs is not None) else schema(LEADS_URL, LEADS_KEY)
-                  table, created_col, sent_col = discover_leads_table(leads_defs)
-                  r = requests.get(f"{LEADS_URL}/rest/v1/{table}",
-                                   params={"select": "*", created_col: f"gte.{window_start}", "order": f"{created_col}.desc"},
-                                   headers=hdr(LEADS_KEY), timeout=20)
-                  r.raise_for_status()
-                  leads = r.json()
-                  # Stuck = no email sent AND older than the 15-minute grace period
-                  stuck = [l for l in leads if l.get(sent_col) is None and (l.get(created_col) or "") <= grace_cutoff]
-                  log(f"Checked {len(leads)} leads, found {len(stuck)} stuck")
+                  leads, stuck = query_leads_directly()
+                  checked_ok = True
               except Exception as e:
-                  log(f"Could not query leads: {e}")
-                  problems.append(f"could not query leads: {e}")
+                  if not STATUS_URL:
+                      log(f"Could not query leads: {e}")
+                      problems.append(f"could not query leads: {e}")
+                  else:
+                      status_endpoint_error = str(e)
+                      log(f"Website status endpoint failed ({e}) - falling back to a direct database check...")
+                      try:
+                          leads, stuck = query_leads_directly()
+                          checked_ok = True
+                          problems.append(f"website status endpoint is down ({status_endpoint_error}) - "
+                                          "checked leads directly instead, so this is still a real result, "
+                                          "but the website endpoint itself needs fixing")
+                      except Exception as e2:
+                          log(f"Direct database fallback also failed: {e2}")
+                          problems.append(f"status endpoint failed ({status_endpoint_error}) and the "
+                                          f"direct database fallback also failed: {e2}")
 
               alert_ok = True
-              if problems:
-                  log("STEP 2: Reporting problems to Telegram...")
-                  alert_ok = tg_ok and send_telegram("Watchdog ERROR:\n- " + "\n- ".join(problems))
-              elif stuck:
+              if stuck:
+                  # Real stuck leads always take priority - never let a secondary problem (e.g. the
+                  # status endpoint being down, already handled by the fallback above) bury this alert.
                   log(f"STEP 2: Sending Telegram alert for {len(stuck)} stuck lead(s)...")
                   lines = []
                   for l in stuck[:5]:
@@ -305,16 +326,23 @@ jobs:
                   text = ("ALERT: Website leads stuck undelivered\n\n"
                           f"{len(stuck)} lead(s) in the last 26 hours never emailed:\n\n" + "\n".join(lines) +
                           "\n\nThese did NOT reach your inbox. Check /admin or ring them back.")
+                  if problems:
+                      text += "\n\nAlso: " + "; ".join(problems)
                   alert_ok = tg_ok and send_telegram(text)
+              elif problems:
+                  log("STEP 2: Reporting problems to Telegram...")
+                  alert_ok = tg_ok and send_telegram("Watchdog ERROR:\n- " + "\n- ".join(problems))
               else:
                   log("STEP 2: No stuck leads, no alert needed")
 
               log("STEP 3: Writing heartbeat...")
-              if problems:
-                  detail = "watchdog ran with problems: " + "; ".join(problems)
-              else:
+              if checked_ok:
                   alert_word = "sent" if (stuck and alert_ok) else ("FAILED" if stuck else "not needed")
                   detail = f"{len(leads)} leads checked, {len(stuck)} stuck, alert {alert_word}"
+                  if problems:
+                      detail += " (with problems: " + "; ".join(problems) + ")"
+              else:
+                  detail = "watchdog ran with problems: " + "; ".join(problems)
               hb_ok = write_heartbeat(detail)
 
               log("=" * 60)
